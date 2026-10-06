@@ -273,6 +273,8 @@ if [[ $PLATFORM == PVE ]]; then
         esac
         line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
         [[ -n $line ]] || continue
+        # proxmox-boot-tool prints this when its manual kernel list is empty.
+        [[ $line == 'None.' && $section == manual ]] && continue
         valid_abi "$line" && [[ $line == *-pve && -n $section ]] || die "未知 PVE 内核列表格式: $line"
         [[ -n ${IMAGE[$line]+x} ]] || die "PVE 启动选择引用了未安装内核: $line"
         protect "$line" "PVE $section"

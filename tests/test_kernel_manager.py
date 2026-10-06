@@ -263,20 +263,29 @@ def tests():
     f.install()
     record(f,f.run('--keep','1',execute=True),removed=['linux-image-6.1.0-30-amd64','linux-headers-6.1.0-30-amd64'],
            kept=['linux-headers-6.1.0-30-common','linux-headers-6.1.0-30-cloud-amd64'])
-    for mode in ['automatic','manual','pinned','next-boot','bad-format','legacy-name','esp-refresh']:
+    for mode in ['automatic','manual','pinned','next-boot','bad-format','legacy-name','esp-refresh',
+                 'manual-none','manual-none-pinned','manual-none-next-boot','manual-empty',
+                 'none-without-section','none-in-automatic','none-in-pinned']:
         f=Fixture('pve-'+mode,platform='PVE',running='6.8.12-10-pve')
         for rev in [7,8,9,10]:
             package=f'pve-kernel-6.8.12-{rev}-pve' if mode=='legacy-name' else f'proxmox-kernel-6.8.12-{rev}-pve-signed'
             f.package(package,abi=f'6.8.12-{rev}-pve')
-        selection='Manually selected kernels:\n'+('6.8.12-7-pve\n' if mode=='manual' else '')+'\nAutomatically selected kernels:\n6.8.12-8-pve\n6.8.12-9-pve\n6.8.12-10-pve\n'
-        if mode=='pinned': selection+='\nPinned kernel:\n6.8.12-7-pve\n'
-        if mode=='next-boot': selection+='\nKernel pinned on next-boot:\n6.8.12-7-pve\n'
+        # Match the real list_kernels() empty-manual-list output by default.
+        selection='Manually selected kernels:\n'+('6.8.12-7-pve\n' if mode=='manual' else 'None.\n')+'\nAutomatically selected kernels:\n6.8.12-8-pve\n6.8.12-9-pve\n6.8.12-10-pve\n'
+        if mode=='manual-empty': selection=selection.replace('None.\n','')
+        if mode in ['pinned','manual-none-pinned']: selection+='\nPinned kernel:\n6.8.12-7-pve\n'
+        if mode in ['next-boot','manual-none-next-boot']: selection+='\nKernel pinned on next-boot:\n6.8.12-7-pve\n'
+        if mode=='none-without-section': selection='None.\n'+selection
+        if mode=='none-in-automatic': selection=selection.replace('Automatically selected kernels:\n','Automatically selected kernels:\nNone.\n')
+        if mode=='none-in-pinned': selection+='\nPinned kernel:\nNone.\n'
         if mode=='bad-format': selection+='Unknown future format:\n'
         if mode=='esp-refresh': write(f.root/'etc/kernel/proxmox-boot-uuids','fixture-uuid\n')
         write(f.root/'pve-list',selection); f.install()
-        record(f,f.run(execute=True),success=mode!='bad-format',
-               removed=[('pve-kernel-6.8.12-7-pve' if mode=='legacy-name' else 'proxmox-kernel-6.8.12-7-pve-signed')] if mode in ['automatic','legacy-name','esp-refresh'] else [],
+        record(f,f.run(execute=True),success=mode not in ['bad-format','none-without-section','none-in-automatic','none-in-pinned'],
+               removed=[('pve-kernel-6.8.12-7-pve' if mode=='legacy-name' else 'proxmox-kernel-6.8.12-7-pve-signed')] if mode in ['automatic','legacy-name','esp-refresh','manual-none','manual-empty'] else [],
                kept=['pve-kernel-6.8.12-8-pve','pve-kernel-6.8.12-10-pve'] if mode=='legacy-name' else ['proxmox-kernel-6.8.12-8-pve-signed','proxmox-kernel-6.8.12-10-pve-signed'])
+        if mode in ['manual-none-pinned','manual-none-next-boot']:
+            assert 'proxmox-kernel-6.8.12-7-pve-signed' in f.installed()
         if mode=='esp-refresh': assert 'pve-refresh' in (f.root/'actions').read_text()
     for mode in ['normal','metadata-conflict','fat-layout','wrong-family']:
         running='6.12.10-current-sunxi64'
