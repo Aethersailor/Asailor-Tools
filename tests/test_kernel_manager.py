@@ -36,6 +36,7 @@ def write(path, text, executable=False):
 class Fixture:
     def __init__(self, name, *, platform='Debian', running='6.1.0-30-amd64', arch='amd64'):
         self.name, self.platform, self.running, self.arch = name, platform, running, arch
+        self.usr_dtb_targets=set()
         self.root = BASE / name
         self.root.mkdir()
         for directory in ['etc/apt/apt.conf.d', 'etc/default', 'etc/kernel', 'boot/grub',
@@ -69,30 +70,60 @@ class Fixture:
                 '--setenv', 'PATH', '/work/bin:/usr/bin:/usr/sbin:/bin:/sbin',
                 '--setenv', 'LC_ALL', 'C', '--setenv', 'DEBIAN_FRONTEND', 'noninteractive']
         for source, target in [('etc', '/etc'), ('var', '/var'), ('boot', '/boot'),
-                               ('modules', '/lib/modules'), ('usr-src', '/usr/src')]:
+                               ('modules', '/lib/modules'), ('modules', '/usr/lib/modules'), ('usr-src', '/usr/src')]:
             args += ['--bind', str(self.root / source), target]
+        if self.usr_dtb_targets:
+            # Keep the host's runtime read-only while providing private mount
+            # points for versioned /usr/lib/linux-image-* DTB directories.
+            mirror=self.root/'usr-lib-mirror'
+            if not mirror.exists():
+                mirror.mkdir()
+                for entry in Path('/usr/lib').iterdir():
+                    if entry.name=='modules' or entry.name in self.usr_dtb_targets: continue
+                    (mirror/entry.name).symlink_to('/runtime/usr/lib/'+entry.name)
+                (mirror/'modules').mkdir()
+                for target in self.usr_dtb_targets: (mirror/target).mkdir()
+            args+=['--ro-bind','/usr','/runtime/usr','--bind',str(mirror),'/usr/lib',
+                   '--bind',str(self.root/'modules'),'/usr/lib/modules']
         cp = subprocess.run([*args, *command], capture_output=True, text=True, encoding='utf-8', timeout=30)
         return cp
 
-    def package(self, name, *, abi=None, kind='image', depends='', metadata='', version='1.0', package_arch=None):
+    def package(self, name, *, abi=None, kind='image', depends='', metadata='', version='1.0', package_arch=None, layout='boot', stem='vmlinuz', own_modules=True):
         directory = self.root / 'build' / name
         control = f'Package: {name}\nVersion: {version}\nArchitecture: {package_arch or self.arch}\nMaintainer: Fixture <fixture@example.invalid>\nDescription: isolated synthetic package\n'
         if depends:
             control += 'Depends: '+depends+'\n'
         if metadata:
             control += 'Armbian-Kernel-Version-Family: '+metadata+'\n'
+        if package_arch=='all':
+            control += 'Multi-Arch: foreign\n'
         write(directory / 'DEBIAN/control', control)
         write(directory / 'var/lib/kernel-fixtures' / name / 'fixture', 'synthetic, not bootable\n')
         if abi:
             if kind == 'image':
-                write(directory / 'boot' / ('vmlinuz-'+abi), 'synthetic image\n')
-                write(directory / 'lib/modules' / abi / 'kernel/fixture.ko', 'synthetic module\n')
-                write(directory / 'DEBIAN/postinst', '#!/bin/sh\nset -e\nprintf "synthetic initrd\\n" > /boot/initrd.img-'+abi+'\nprintf "synthetic uInitrd\\n" > /boot/uInitrd-'+abi+'\n', True)
-                write(directory / 'DEBIAN/postrm', '#!/bin/sh\nset -e\nrm -f /boot/initrd.img-'+abi+' /boot/uInitrd-'+abi+'\nprintf "purge '+name+'\\n" >> /work/actions\n', True)
+                image_path = 'boot/'+stem+'-'+abi if layout=='boot' else 'usr/lib/modules/'+abi+'/'+stem
+                write(directory / image_path, 'synthetic image '+abi+'\n')
+                if own_modules and not name.startswith('linux-binary-'):
+                    write(directory / 'lib/modules' / abi / 'kernel/fixture.ko', 'synthetic module\n')
+                if not name.startswith('linux-binary-'):
+                    write(directory / 'DEBIAN/postinst', '#!/bin/sh\nset -e\nprintf "synthetic initrd '+abi+'\\n" > /boot/initrd.img-'+abi+'\nprintf "synthetic uInitrd '+abi+'\\n" > /boot/uInitrd-'+abi+'\n', True)
+                    write(directory / 'DEBIAN/postrm', '#!/bin/sh\nset -e\nrm -f /boot/initrd.img-'+abi+' /boot/uInitrd-'+abi+'\nprintf "purge '+name+'\\n" >> /work/actions\n', True)
+            elif kind=='wrapper':
+                copy='cp /usr/lib/modules/'+abi+'/vmlinuz /boot/vmlinuz-'+abi+'\n' if layout!='boot' else ''
+                write(directory/'DEBIAN/postinst','#!/bin/sh\nset -e\n'+copy+'printf "synthetic initrd '+abi+'\\n" > /boot/initrd.img-'+abi+'\nprintf "synthetic uInitrd '+abi+'\\n" > /boot/uInitrd-'+abi+'\n',True)
+                cleanup=' /boot/vmlinuz-'+abi if layout!='boot' else ''
+                write(directory/'DEBIAN/postrm','#!/bin/sh\nset -e\nrm -f /boot/initrd.img-'+abi+' /boot/uInitrd-'+abi+cleanup+'\nprintf "purge '+name+'\\n" >> /work/actions\n',True)
             elif kind == 'headers':
                 write(directory / 'usr/src' / ('linux-headers-'+abi) / 'fixture.h', 'synthetic header\n')
             elif kind == 'dtb':
-                write(directory / 'boot' / ('dtb-'+abi) / 'fixture.dtb', 'synthetic dtb\n')
+                dtb_path='usr/lib/linux-image-'+abi if layout=='usr-dtb' else 'boot/dtb-'+abi
+                if layout=='usr-dtb': self.usr_dtb_targets.add('linux-image-'+abi)
+                write(directory / dtb_path / 'fixture.dtb', 'synthetic dtb '+abi+'\n')
+            elif kind == 'modules':
+                filename='fixture-extra.ko' if '-extra-' in name else 'fixture.ko'
+                write(directory / 'usr/lib/modules' / abi / 'kernel' / filename, 'synthetic module '+abi+'\n')
+            elif kind == 'base':
+                write(directory / 'usr/lib/modules' / abi / 'config', 'synthetic config '+abi+'\n')
         cp = subprocess.run(['dpkg-deb', '--root-owner-group', '--build', str(directory), str(self.root/'debs'/(name+'.deb'))], capture_output=True, text=True)
         assert cp.returncode == 0, cp.stderr
 
@@ -106,8 +137,26 @@ class Fixture:
                 self.package('linux-headers-'+abi, abi=abi, kind='headers', depends=common)
         return self
 
+    def split(self, *, layout='modules', versions=('7.2.7+deb14','7.2.8+deb14','7.2.9+deb14'), flavour='cloud-amd64'):
+        for version in versions:
+            abi=version+'-'+flavour
+            base='linux-base-'+abi
+            binary='linux-binary-'+abi
+            modules='linux-modules-'+abi
+            self.package(base,abi=abi,kind='base')
+            self.package(binary,abi=abi,depends=base,layout=layout)
+            self.package(modules,abi=abi,kind='modules',depends=base)
+            self.package('linux-image-'+abi,abi=abi,kind='wrapper',layout=layout,depends=', '.join([base,binary,modules]))
+            common='linux-headers-'+version+'-common'
+            self.package(common,abi=version+'-common',kind='headers',package_arch='all')
+            self.package('linux-headers-'+abi,abi=abi,kind='headers',depends=base+', '+common)
+        latest=versions[-1]+'-'+flavour
+        self.package('linux-image-'+flavour,depends='linux-image-'+latest)
+        self.package('linux-base-'+flavour,depends='linux-base-'+latest)
+        return self
+
     def install(self):
-        registration = '/usr/bin/dpkg --add-architecture arm64\n' if self.arch=='arm64' else ''
+        registration = '/usr/bin/dpkg --add-architecture '+self.arch+'\n' if self.arch!='amd64' else ''
         write(self.root/'setup.sh', '#!/bin/sh\nset -e\n'+registration+'/usr/bin/dpkg --force-architecture -i /work/debs/*.deb\n', True)
         cp=self.command('/bin/sh','/work/setup.sh')
         assert cp.returncode == 0, cp.stdout+cp.stderr
@@ -166,6 +215,90 @@ def tests():
     cp=f.command('/usr/bin/python3','-c',"import errno,os,pathlib; assert os.geteuid()==0; assert pathlib.Path('/var/lib/dpkg/status').read_bytes()==b''; assert all(n.split(':')[0].strip()=='lo' for n in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]); assert any(l.split()[4]=='/usr' and 'ro' in l.split()[5].split(',') for l in pathlib.Path('/proc/self/mountinfo').read_text().splitlines()); p='/usr/bin/true'; err=None;\ntry: open(p,'r+b').close()\nexcept OSError as e: err=e.errno\nassert err in (errno.EROFS,errno.EACCES)")
     assert cp.returncode==0,cp.stdout+cp.stderr
     RESULTS.append({'case':f.name,'passed':True,'exit':0}); print('PASS '+f.name,flush=True)
+    # Debian >=6.19 split packages, including the >=7.2 module-tree payload.
+    for layout in ['boot','modules']:
+        for arch,flavour in [('amd64','amd64'),('amd64','cloud-amd64'),('amd64','rt-amd64'),('arm64','arm64-16k')]:
+            f=Fixture('split-'+layout+'-'+flavour,running='7.2.9+deb14-'+flavour,arch=arch).split(layout=layout,flavour=flavour)
+            f.install()
+            old='7.2.7+deb14-'+flavour
+            record(f,f.run(execute=True),removed=['linux-image-'+old,'linux-binary-'+old,'linux-base-'+old,'linux-modules-'+old,'linux-headers-'+old],
+                   kept=['linux-image-'+flavour,'linux-base-'+flavour,'linux-image-7.2.9+deb14-'+flavour,'linux-image-7.2.8+deb14-'+flavour])
+    for mode in ['binary','wrapper','modules','base','headers']:
+        f=Fixture('split-hold-'+mode,running='7.2.9+deb14-cloud-amd64').split(); f.install()
+        package='linux-'+mode+'-7.2.7+deb14-cloud-amd64' if mode!='wrapper' else 'linux-image-7.2.7+deb14-cloud-amd64'
+        assert f.command('/usr/bin/apt-mark','hold',package).returncode==0
+        record(f,f.run(),kept=['linux-image-7.2.7+deb14-cloud-amd64'],contains='包已 hold')
+    for mode in ['payload-mismatch','missing-copy','alias-copy','pending-upgrade','mixed-layout']:
+        running='7.2.8+deb14-cloud-amd64' if mode=='pending-upgrade' else '7.2.9+deb14-cloud-amd64'
+        f=Fixture('split-'+mode,running=running).split()
+        if mode=='mixed-layout':
+            f.package('linux-image-6.12.107+deb13-cloud-amd64',abi='6.12.107+deb13-cloud-amd64')
+        f.install()
+        if mode=='payload-mismatch': write(f.root/'boot/vmlinuz-7.2.9+deb14-cloud-amd64','mismatched boot copy')
+        if mode=='missing-copy': (f.root/'boot/vmlinuz-7.2.9+deb14-cloud-amd64').unlink()
+        if mode=='alias-copy': (f.root/'boot/vmlinuz').symlink_to('vmlinuz-7.2.9+deb14-cloud-amd64')
+        record(f,f.run(execute=True),success=mode not in ['payload-mismatch','missing-copy'],
+               kept=['linux-image-7.2.9+deb14-cloud-amd64','linux-image-7.2.8+deb14-cloud-amd64'],
+               removed=['linux-image-7.2.7+deb14-cloud-amd64'] if mode in ['alias-copy','mixed-layout'] else [])
+        if mode=='pending-upgrade': assert 'linux-image-7.2.7+deb14-cloud-amd64' in f.installed()
+    f=Fixture('split-unsigned-artifact',running='7.2.9+deb14-cloud-amd64').split()
+    abi='7.2.7+deb14-cloud-amd64'
+    f.package('linux-binary-unsigned-'+abi)
+    directory=f.root/'build'/('linux-binary-unsigned-'+abi)
+    write(directory/'usr/lib/modules'/abi/'vmlinuz.unsigned','unsigned build artifact')
+    subprocess.run(['dpkg-deb','--root-owner-group','--build',str(directory),str(f.root/'debs'/('linux-binary-unsigned-'+abi+'.deb'))],check=True,capture_output=True)
+    f.package('linux-image-'+abi+'-unsigned',depends='linux-binary-unsigned-'+abi)
+    f.install()
+    record(f,f.run(execute=True),removed=['linux-binary-unsigned-'+abi,'linux-image-'+abi+'-unsigned','linux-image-'+abi])
+    f=Fixture('release-candidate-order',running='7.2.0-amd64')
+    for abi in ['7.2.0-rc7-amd64','7.2.0-amd64','7.1.13+deb14-amd64']:
+        f.package('linux-image-'+abi,abi=abi)
+    f.install()
+    record(f,f.run('--keep','1',execute=True),removed=['linux-image-7.2.0-rc7-amd64','linux-image-7.1.13+deb14-amd64'],kept=['linux-image-7.2.0-amd64'])
+    f=Fixture('shared-boot-owner').normal()
+    directory=f.root/'build/linux-headers-6.1.0-28-amd64'
+    write(directory/'boot/Image','synthetic image 6.1.0-30-amd64\n')
+    subprocess.run(['dpkg-deb','--root-owner-group','--build',str(directory),str(f.root/'debs/linux-headers-6.1.0-28-amd64.deb')],check=True,capture_output=True)
+    f.install()
+    record(f,f.run(),kept=['linux-image-6.1.0-28-amd64'],contains='软件包拥有共享启动入口')
+    f=Fixture('protected-payload-change').normal(); f.install()
+    record(f,f.run(execute=True,mutate="open('/boot/vmlinuz-6.1.0-30-amd64','a').write('changed')"),success=False,
+           kept=['linux-image-6.1.0-28-amd64'],contains='受保护内核文件改变')
+    for arch,flavour in [('i386','686-pae'),('ppc64el','powerpc64le')]:
+        f=Fixture('architecture-'+arch,running='6.1.0-30-'+flavour,arch=arch)
+        stem='vmlinux' if arch=='ppc64el' else 'vmlinuz'
+        for revision in [28,29,30]:
+            abi=f'6.1.0-{revision}-'+flavour
+            f.package('linux-image-'+abi,abi=abi,stem=stem)
+        f.install()
+        record(f,f.run(execute=True),removed=['linux-image-6.1.0-28-'+flavour],kept=['linux-image-6.1.0-30-'+flavour])
+    f=Fixture('configured-old-alias').normal(); f.install()
+    (f.root/'boot/vmlinuz.old').symlink_to('vmlinuz-6.1.0-28-amd64')
+    write(f.root/'boot/boot.cmd','boot /boot/vmlinuz.old\n')
+    record(f,f.run('--keep','1',execute=True),removed=['linux-image-6.1.0-29-amd64'],kept=['linux-image-6.1.0-28-amd64','linux-image-6.1.0-30-amd64'])
+    f=Fixture('unused-broken-old-alias').normal(); f.install()
+    (f.root/'boot/vmlinuz.old').symlink_to('missing-unused-old-image')
+    record(f,f.run(execute=True),removed=['linux-image-6.1.0-28-amd64'])
+    for mode in ['signed','unsigned-prefix','shared-headers']:
+        f=Fixture('ubuntu-'+mode,running='6.8.0-107-generic')
+        write(f.root/'etc/os-release','ID=ubuntu\n')
+        prefix='linux-image-unsigned-' if mode=='unsigned-prefix' else 'linux-image-'
+        for revision in [105,106,107]:
+            abi=f'6.8.0-{revision}-generic'
+            common=f'linux-headers-6.8.0-{revision}'
+            f.package(prefix+abi,abi=abi,own_modules=False)
+            f.package('linux-modules-'+abi,abi=abi,kind='modules')
+            f.package('linux-modules-extra-'+abi,abi=abi,kind='modules')
+            f.package(common,abi=f'6.8.0-{revision}',kind='headers',package_arch='all')
+            f.package('linux-headers-'+abi,abi=abi,kind='headers',depends=common)
+        if mode=='shared-headers':
+            abi='6.8.0-105-lowlatency'
+            f.package('linux-image-'+abi,abi=abi)
+            f.package('linux-headers-'+abi,abi=abi,kind='headers',depends='linux-headers-6.8.0-105')
+        f.install()
+        record(f,f.run(execute=True),removed=[prefix+'6.8.0-105-generic','linux-headers-6.8.0-105-generic','linux-modules-6.8.0-105-generic','linux-modules-extra-6.8.0-105-generic'],
+               kept=['linux-headers-6.8.0-105'] if mode=='shared-headers' else [])
+        if mode!='shared-headers': assert 'linux-headers-6.8.0-105' not in f.installed()
     # End-to-end cleanup with real APT, real dpkg, and the real v3 transaction hook.
     for name,kwargs,args in [('debian',{},()),('unsigned',{'unsigned':True},()),
                             ('keep-one',{},('--keep','1')),('keep-three',{},('--keep','3'))]:
@@ -287,24 +420,52 @@ def tests():
         if mode in ['manual-none-pinned','manual-none-next-boot']:
             assert 'proxmox-kernel-6.8.12-7-pve-signed' in f.installed()
         if mode=='esp-refresh': assert 'pve-refresh' in (f.root/'actions').read_text()
-    for mode in ['normal','metadata-conflict','fat-layout','wrong-family']:
-        running='6.12.10-current-sunxi64'
+    f=Fixture('pve-with-debian-kernels',platform='PVE',running='6.8.12-10-pve').split()
+    for rev in [7,8,9,10]: f.package(f'proxmox-kernel-6.8.12-{rev}-pve-signed',abi=f'6.8.12-{rev}-pve')
+    write(f.root/'pve-list','Manually selected kernels:\nNone.\n\nAutomatically selected kernels:\n6.8.12-9-pve\n6.8.12-10-pve\n')
+    f.install()
+    record(f,f.run(execute=True),removed=['proxmox-kernel-6.8.12-7-pve-signed','proxmox-kernel-6.8.12-8-pve-signed'],
+           kept=['linux-image-7.2.7+deb14-cloud-amd64','linux-image-7.2.8+deb14-cloud-amd64','linux-image-7.2.9+deb14-cloud-amd64'])
+    for mode in ['normal','metadata-conflict','fat-layout','fat-copies','fat-unknown-dtb','usr-dtb','grub','pending-upgrade','wrong-family']:
+        running='6.12.10-current-sunxi64' if mode=='pending-upgrade' else '6.18.10-edge-sunxi64'
         f=Fixture('armbian-'+mode,platform='Armbian',running=running,arch='arm64')
         for branch,version in [('legacy','6.1.10'),('current','6.12.10'),('edge','6.18.10')]:
             abi=version+'-'+branch+'-sunxi64'
             suffix=branch+'-sunxi64'
             f.package('linux-image-'+suffix,abi=abi,metadata='6.0.0-invalid' if mode=='metadata-conflict' and branch=='legacy' else abi)
             f.package('linux-headers-'+suffix,abi=abi,kind='headers',metadata=abi)
-            f.package('linux-dtb-'+suffix,abi=abi,kind='dtb',metadata=abi)
+            f.package('linux-dtb-'+suffix,abi=abi,kind='dtb',metadata=abi,layout='usr-dtb' if mode=='usr-dtb' else 'boot')
         f.install()
         for name,target in [('Image','vmlinuz-'+running),('uInitrd','uInitrd-'+running),('dtb','dtb-'+running)]:
-            (f.root/'boot'/name).symlink_to(target)
+            (f.root/'boot'/name).symlink_to('/usr/lib/linux-image-'+running if mode=='usr-dtb' and name=='dtb' else target)
         if mode=='fat-layout':
             (f.root/'boot/Image').unlink(); write(f.root/'boot/Image','regular FAT image')
+        if mode in ['fat-copies','fat-unknown-dtb']:
+            for name in ['Image','uInitrd','dtb']: (f.root/'boot'/name).unlink()
+            shutil.copyfile(f.root/'boot'/('vmlinuz-'+running),f.root/'boot/Image')
+            initrd=(f.root/'boot'/('initrd.img-'+running)).read_bytes()
+            (f.root/'boot/uInitrd').write_bytes(bytes.fromhex('27051956')+bytes(60)+initrd)
+            shutil.copytree(f.root/'boot'/('dtb-'+running),f.root/'boot/dtb')
+            if mode=='fat-unknown-dtb': write(f.root/'boot/dtb/fixture.dtb','unattributable DTB')
+        if mode=='grub':
+            for name in ['Image','uInitrd','dtb']: (f.root/'boot'/name).unlink()
         if mode=='wrong-family': write(f.root/'etc/armbian-release','LINUXFAMILY=meson64\n')
-        record(f,f.run(execute=True),success=mode=='normal',
-               removed=['linux-image-legacy-sunxi64','linux-headers-legacy-sunxi64','linux-dtb-legacy-sunxi64'] if mode=='normal' else [],
+        record(f,f.run(execute=True),success=mode in ['normal','fat-copies','fat-unknown-dtb','usr-dtb','grub','pending-upgrade'],
+               removed=['linux-image-legacy-sunxi64','linux-headers-legacy-sunxi64','linux-dtb-legacy-sunxi64'] if mode in ['normal','fat-copies','usr-dtb','grub'] else [],
                kept=['linux-image-current-sunxi64','linux-image-edge-sunxi64'])
+        if mode in ['fat-unknown-dtb','pending-upgrade']: assert 'linux-image-legacy-sunxi64' in f.installed()
+        if mode=='grub': assert 'grub-refresh' in (f.root/'actions').read_text()
+    f=Fixture('armbian-abi-without-branch',platform='Armbian',running='6.18.10-sunxi64',arch='arm64')
+    for branch,version in [('legacy','6.1.10'),('current','6.12.10'),('edge','6.18.10')]:
+        abi=version+'-sunxi64'; suffix=branch+'-sunxi64'
+        f.package('linux-image-'+suffix,abi=abi)
+        f.package('linux-headers-'+suffix,abi=abi,kind='headers')
+        f.package('linux-dtb-'+suffix,abi=abi,kind='dtb')
+    f.install()
+    for name,target in [('Image','vmlinuz-'+f.running),('uInitrd','uInitrd-'+f.running),('dtb','dtb-'+f.running)]:
+        (f.root/'boot'/name).symlink_to(target)
+    record(f,f.run(execute=True),removed=['linux-image-legacy-sunxi64','linux-headers-legacy-sunxi64','linux-dtb-legacy-sunxi64'],
+           kept=['linux-image-current-sunxi64','linux-image-edge-sunxi64'])
     for name,mutation,message in [
         ('confirm-boot-change',"open('/etc/default/grub','w').write('GRUB_DEFAULT=saved\\n')",'启动配置改变'),
         ('confirm-hold-change',"os.system('/usr/bin/apt-mark hold linux-image-6.1.0-28-amd64 >/dev/null')",'状态改变')]:

@@ -44,7 +44,7 @@ while (($#)); do
 done
 ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) || die '需要 Bash 4.4 或更新版本。'
 ((EUID == 0)) || die '请使用 root 权限运行。'
-for command_name in apt-get apt-mark dpkg dpkg-query uname sort realpath sha256sum cat; do
+for command_name in apt-get apt-mark dpkg dpkg-query uname sort realpath readlink sha256sum cat cmp; do
     command -v "$command_name" >/dev/null || die "缺少必需命令: $command_name"
 done
 [[ $(uname -s) == Linux ]] || die '仅支持 Linux 系统。'
@@ -102,7 +102,7 @@ INITIAL_INVENTORY=$(inventory) || die '无法读取已安装软件包。'
 INITIAL_HOLDS=$(apt-mark showhold) || die '无法读取 hold 列表。'
 declare -a PACKAGES=() ABIS=() CANDIDATES=() CANDIDATE_ABIS=()
 declare -A VERSION=() ARCH=() DEPENDS=() META_ABI=() BY_BASE=()
-declare -A FILES=() IMAGE=() IMAGE_PATH=() GROUP=() ORDER_VERSION=() COMPONENTS=()
+declare -A FILES=() IMAGE=() IMAGE_PATH=() BOOT_IMAGE=() GROUP=() ORDER_VERSION=() COMPONENTS=()
 declare -A PROTECTED=() HELD=() CANDIDATE_SET=()
 while IFS=';' read -r package status version arch depends metadata; do
     [[ -n $package ]] || continue
@@ -130,11 +130,58 @@ elif [[ -e /etc/armbian-release ]]; then
 else
     os_id=$(read_release_field /etc/os-release ID)
     [[ $os_id == debian || $os_id == ubuntu ]] || die "未适配的发行版: $os_id"
+    [[ $os_id != ubuntu ]] || PLATFORM=Ubuntu
+fi
+BOOT_BACKEND=unsupported
+if [[ $PLATFORM == PVE ]]; then
+    BOOT_BACKEND=pve
+elif [[ $PLATFORM == Armbian && ( -e /boot/Image || -e /boot/zImage || -e /boot/uImage || -e /boot/uInitrd ) ]]; then
+    BOOT_BACKEND=u-boot
+elif command -v update-grub >/dev/null && [[ -d /boot/grub ]]; then
+    BOOT_BACKEND=grub
 fi
 load_files() {
     local package=$1
     if [[ -z ${FILES[$package]+x} ]]; then
         FILES["$package"]=$(dpkg-query -L "$package") || die "无法读取软件包文件清单: $package"
+    fi
+}
+dependency_names() {
+    local relations=${1//|/,} relation dependency
+    local -a parts=()
+    IFS=',' read -r -a parts <<<"$relations"
+    for relation in "${parts[@]}"; do
+        dependency=${relation#"${relation%%[![:space:]]*}"}
+        dependency=${dependency%%[[:space:](]*}; dependency=${dependency%%:*}
+        [[ -z $dependency ]] || printf '%s\n' "$dependency"
+    done
+}
+depends_on() {
+    local package=$1 dependency=$2 name names
+    names=$(dependency_names "${DEPENDS[$package]}")
+    while IFS= read -r name; do
+        [[ $name != "$dependency" ]] || return 0
+    done <<<"$names"
+    return 1
+}
+files_equal() {
+    local result
+    if cmp -s -- "$@"; then return 0; else result=$?; fi
+    ((result == 1)) || die "无法比对启动文件: $1: $2"
+    return 1
+}
+debian_flavour() {
+    if [[ $1 =~ ^([0-9][0-9A-Za-z.+~_]*(-rc[0-9][0-9A-Za-z.+~_]*)?(-[0-9][0-9A-Za-z.+~_]*)?)-(.+)$ ]]; then
+        printf '%s' "${BASH_REMATCH[4]}"
+    else
+        die "无法识别内核风格: $1"
+    fi
+}
+kernel_release() {
+    if [[ $1 =~ ^([0-9][0-9A-Za-z.+~_]*(-rc[0-9][0-9A-Za-z.+~_]*)?(-[0-9][0-9A-Za-z.+~_]*)?)-(.+)$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        die "无法识别内核版本: $1"
     fi
 }
 protect() {
@@ -152,6 +199,11 @@ verify_kernel_paths() {
             /boot/initrd.img-*) owned_abi=${path#/boot/initrd.img-} ;;
             /boot/uInitrd-*) owned_abi=${path#/boot/uInitrd-} ;;
             /boot/dtb-*) owned_abi=${path#/boot/dtb-}; owned_abi=${owned_abi%%/*} ;;
+            /boot/config-*) owned_abi=${path#/boot/config-} ;;
+            /boot/System.map-*) owned_abi=${path#/boot/System.map-} ;;
+            /boot/symvers-*) owned_abi=${path#/boot/symvers-} ;;
+            /usr/lib/linux-image-*) owned_abi=${path#/usr/lib/linux-image-}; owned_abi=${owned_abi%%/*} ;;
+            /usr/src/linux-headers-*) owned_abi=${path#/usr/src/linux-headers-}; owned_abi=${owned_abi%%/*} ;;
         esac
         [[ -z $owned_abi || $owned_abi == "$abi" ]] || die "软件包包含其它 ABI 的启动/模块文件，拒绝清理: $package: $path"
     done <<<"${FILES[$package]}"
@@ -161,7 +213,7 @@ for package in "${PACKAGES[@]}"; do
     [[ ${ARCH[$package]} == "$NATIVE_ARCH" || ${ARCH[$package]} == all ]] || continue
     case "$base" in
         *-dbg|*-dbgsym|*-signed-template) continue ;;
-        linux-image-*|proxmox-kernel-*|pve-kernel-*) ;;
+        linux-image-*|linux-binary-*|proxmox-kernel-*|pve-kernel-*) ;;
         *) continue ;;
     esac
     load_files "$package"
@@ -173,6 +225,11 @@ for package in "${PACKAGES[@]}"; do
                 valid_abi "$abi" || die "软件包包含异常内核路径: $package: $path"
                 [[ -z $found_abi || $found_abi == "$abi" ]] || die "软件包包含多个内核，拒绝猜测: $package"
                 found_abi=$abi; image_path=$path ;;
+            /usr/lib/modules/*/vmlinuz|/usr/lib/modules/*/vmlinux|/lib/modules/*/vmlinuz|/lib/modules/*/vmlinux)
+                abi=${path%/*}; abi=${abi##*/}
+                valid_abi "$abi" || die "软件包包含异常内核路径: $package: $path"
+                [[ -z $found_abi || $found_abi == "$abi" ]] || die "软件包包含多个内核，拒绝猜测: $package"
+                found_abi=$abi; image_path=$path ;;
         esac
     done <<<"${FILES[$package]}"
     # Metapackages do not own a kernel image; unsigned suffixes do not matter.
@@ -181,22 +238,30 @@ for package in "${PACKAGES[@]}"; do
     verify_kernel_paths "$package" "$abi"
     [[ -z ${IMAGE[$abi]+x} ]] || die "同一内核由多个镜像包拥有: $abi"
     IMAGE["$abi"]=$package; IMAGE_PATH["$abi"]=$image_path
-    ABIS+=("$abi"); COMPONENTS["$abi"]=$package; ORDER_VERSION["$abi"]=$abi
-    if [[ $PLATFORM == PVE ]]; then
-        [[ $base == proxmox-kernel-* || $base == pve-kernel-* ]] && [[ $abi == *-pve ]] || die "PVE 安装了非 PVE 内核，请分开管理: $package"
-        GROUP["$abi"]=pve
-    elif [[ $PLATFORM == Armbian ]]; then
-        [[ $base == linux-image-*"-$ARM_FAMILY" ]] || die "存在非当前硬件家族的内核: $package"
-        suffix=${base#linux-image-}
-        [[ $abi == *"-$suffix" ]] || die "Armbian 包名与内核文件不一致: $package: $abi"
-        [[ -z ${META_ABI[$package]} || ${META_ABI[$package]} == "$abi" ]] || die "Armbian 内核元数据不一致: $package"
-        GROUP["$abi"]="armbian-$ARM_FAMILY"; ORDER_VERSION["$abi"]=${abi%"-$suffix"}
-    else
-        if [[ $abi =~ ^[0-9][0-9A-Za-z.+~_]*(-[0-9][0-9A-Za-z.+~_]*)?-(.+)$ ]]; then
-            GROUP["$abi"]=${BASH_REMATCH[2]}
-        else
-            die "无法识别内核风格: $abi"
+    BOOT_IMAGE["$abi"]=$image_path
+    if [[ $image_path == */modules/* ]]; then
+        boot_copy="/boot/${image_path##*/}-$abi"
+        BOOT_IMAGE["$abi"]=$boot_copy
+        if [[ -s $boot_copy ]]; then
+            files_equal "$image_path" "$boot_copy" || die "启动镜像与软件包镜像内容不一致: $abi"
         fi
+    fi
+    ABIS+=("$abi"); COMPONENTS["$abi"]=$package; ORDER_VERSION["$abi"]=${abi/-rc/~rc}
+    if [[ $PLATFORM == PVE ]]; then
+        if [[ ( $base == proxmox-kernel-* || $base == pve-kernel-* ) && $abi == *-pve ]]; then
+            GROUP["$abi"]=pve
+        else
+            GROUP["$abi"]="foreign-$(debian_flavour "$abi")"
+            protect "$abi" 'PVE 主机上的非 PVE 内核，保留'
+        fi
+    elif [[ $PLATFORM == Armbian ]]; then
+        [[ $abi == *"-$ARM_FAMILY" ]] || die "存在非当前硬件家族的内核: $package: $abi"
+        [[ -z ${META_ABI[$package]} || ${META_ABI[$package]} == "$abi" ]] || die "Armbian 内核元数据不一致: $package"
+        GROUP["$abi"]="armbian-$ARM_FAMILY"
+        release=$(kernel_release "$abi")
+        ORDER_VERSION["$abi"]=${release/-rc/~rc}
+    else
+        GROUP["$abi"]=$(debian_flavour "$abi")
     fi
 done
 ((${#ABIS[@]})) || die '没有识别到由软件包实际拥有的内核镜像。'
@@ -206,12 +271,28 @@ done
 for abi in "${ABIS[@]}"; do
     for package in "${PACKAGES[@]}"; do
         base=${package%%:*}
+        [[ $package != "${IMAGE[$abi]}" ]] || continue
         [[ ${ARCH[$package]} == "$NATIVE_ARCH" || ${ARCH[$package]} == all ]] || continue
         matching=0
         case "$base" in
             "linux-headers-$abi"|"linux-modules-$abi"|"linux-modules-extra-$abi"|\
             "linux-binary-$abi"|"linux-binary-unsigned-$abi"|"linux-base-$abi"|\
             "proxmox-headers-$abi"|"pve-headers-$abi") matching=1 ;;
+            "linux-image-$abi"|"linux-image-$abi-unsigned")
+                # Debian's split image wrapper has no payload. Its dependency
+                # on this ABI's proven image owner provides the association.
+                if depends_on "$package" "${IMAGE[$abi]%%:*}"; then
+                    matching=2
+                elif [[ -n ${BY_BASE[linux-binary-unsigned-$abi]+x} ]] && depends_on "$package" "linux-binary-unsigned-$abi"; then
+                    payload=${BY_BASE[linux-binary-unsigned-$abi]}
+                    load_files "$payload"
+                    verify_kernel_paths "$payload" "$abi"
+                    while IFS= read -r path; do
+                        case "$path" in
+                            "/usr/lib/modules/$abi/vmlinuz.unsigned"|"/lib/modules/$abi/vmlinuz.unsigned") matching=2 ;;
+                        esac
+                    done <<<"${FILES[$payload]}"
+                fi ;;
         esac
         if [[ $PLATFORM == Armbian ]]; then
             suffix=${IMAGE[$abi]%%:*}; suffix=${suffix#linux-image-}
@@ -220,10 +301,12 @@ for abi in "${ABIS[@]}"; do
         ((matching)) || continue
         load_files "$package"
         evidence=0
+        ((matching != 2)) || evidence=1
         while IFS= read -r path; do
             case "$path" in
                 "/lib/modules/$abi"|"/lib/modules/$abi/"*|"/usr/lib/modules/$abi"|"/usr/lib/modules/$abi/"*|\
-                "/usr/src/linux-headers-$abi"|"/usr/src/linux-headers-$abi/"*|"/boot/dtb-$abi"|"/boot/dtb-$abi/"*) evidence=1 ;;
+                "/usr/src/linux-headers-$abi"|"/usr/src/linux-headers-$abi/"*|"/boot/dtb-$abi"|"/boot/dtb-$abi/"*|\
+                "/usr/lib/linux-image-$abi"|"/usr/lib/linux-image-$abi/"*) evidence=1 ;;
             esac
         done <<<"${FILES[$package]}"
         if ((evidence)); then
@@ -234,6 +317,20 @@ for abi in "${ABIS[@]}"; do
             warn "未确认组件归属，保留: $package"
         fi
     done
+done
+for abi in "${ABIS[@]}"; do
+    while IFS= read -r package; do
+        load_files "$package"
+        while IFS= read -r path; do
+            case "$path" in
+                /vmlinuz|/vmlinux|/initrd.img|/boot/vmlinuz|/boot/vmlinux|/boot/initrd.img|\
+                /boot/Image|/boot/zImage|/boot/uImage|/boot/uInitrd|/boot/dtb|\
+                /vmlinuz.old|/vmlinux.old|/initrd.img.old|/boot/vmlinuz.old|/boot/vmlinux.old|/boot/initrd.img.old|\
+                /boot/Image.old|/boot/zImage.old|/boot/uImage.old|/boot/uInitrd.old|/boot/dtb.old|/boot/grub/*|/boot/loader/*)
+                    protect "$abi" "软件包拥有共享启动入口: $package" ;;
+            esac
+        done <<<"${FILES[$package]}"
+    done <<<"${COMPONENTS[$abi]}"
 done
 protect "$RUNNING_KERNEL" '当前运行'
 # Use dpkg's version comparison, not lexical ordering of kernel flavours.
@@ -258,6 +355,17 @@ for abi in "${SORTED_ABIS[@]}"; do
         [[ -z ${HELD[${package%%:*}]+x} ]] || protect "$abi" "包已 hold: $package"
     done <<<"${COMPONENTS[$abi]}"
 done
+if ((KEEP >= 2)); then
+    # A pending upgrade must not replace the running kernel's usable fallback.
+    for abi in "${SORTED_ABIS[@]}"; do
+        if [[ $RUNNING_KERNEL != *-rc[0-9]* && $abi == *-rc[0-9]* ]]; then continue; fi
+        if [[ ${GROUP[$abi]} == "${GROUP[$RUNNING_KERNEL]}" ]] &&
+            dpkg --compare-versions "${ORDER_VERSION[$abi]}" lt "${ORDER_VERSION[$RUNNING_KERNEL]}"; then
+            protect "$abi" '当前运行内核的上一版本备用'
+            break
+        fi
+    done
+fi
 # All boot-tool selections are authoritative, including its automatic fallbacks.
 PVE_SELECTION=''
 if [[ $PLATFORM == PVE ]]; then
@@ -285,8 +393,10 @@ boot_state() {
     local path
     local -a paths
     shopt -s nullglob
-    paths=(/vmlinuz /initrd.img /boot/vmlinuz /boot/initrd.img
+    paths=(/vmlinuz /vmlinux /initrd.img /boot/vmlinuz /boot/vmlinux /boot/initrd.img
         /boot/Image /boot/zImage /boot/uImage /boot/uInitrd /boot/dtb
+        /vmlinuz.old /vmlinux.old /initrd.img.old /boot/vmlinuz.old /boot/vmlinux.old /boot/initrd.img.old
+        /boot/Image.old /boot/zImage.old /boot/uImage.old /boot/uInitrd.old /boot/dtb.old
         /etc/kernel/proxmox-boot-manual-kernels /etc/kernel/proxmox-boot-pin
         /etc/kernel/next-boot-pin /etc/kernel/proxmox-boot-uuids
         /etc/default/grub /etc/default/grub.d/*.cfg /boot/grub/grubenv
@@ -295,10 +405,11 @@ boot_state() {
     shopt -u nullglob
     for path in "${paths[@]}"; do
         printf '%s|' "$path"
-        if [[ -L $path ]]; then realpath -e -- "$path" || return 1
+        if [[ -L $path && $path == *.old ]]; then readlink -- "$path" || return 1
+        elif [[ -L $path ]]; then realpath -e -- "$path" || return 1
         elif [[ -f $path ]]; then sha256sum -- "$path" || return 1
         elif [[ -e $path ]]; then
-            [[ $path == /boot/dtb && -d $path ]] || return 1
+            [[ ( $path == /boot/dtb || $path == /boot/dtb.old ) && -d $path ]] || return 1
             printf 'directory\n'
         else printf 'absent\n'
         fi
@@ -309,10 +420,14 @@ shopt -s nullglob
 BOOT_CONFIGS=(/etc/default/grub /etc/default/grub.d/*.cfg /boot/armbianEnv.txt
     /boot/boot.cmd /boot/extlinux/extlinux.conf /boot/loader/loader.conf /boot/loader/entries/*.conf)
 shopt -u nullglob
+declare -A EXTRA_BOOT_ALIASES=()
 for path in "${BOOT_CONFIGS[@]}"; do
     [[ ! -e $path ]] && continue
     [[ -r $path ]] || die "无法读取启动配置: $path"
     content=$(cat -- "$path") || die "无法读取启动配置: $path"
+    for alias in /vmlinuz.old /vmlinux.old /initrd.img.old /boot/vmlinuz.old /boot/vmlinux.old /boot/initrd.img.old /boot/Image.old /boot/zImage.old /boot/uImage.old /boot/uInitrd.old /boot/dtb.old; do
+        [[ $content != *"$alias"* ]] || EXTRA_BOOT_ALIASES["$alias"]=1
+    done
     for abi in "${ABIS[@]}"; do
         escaped=${abi//./\\.}; escaped=${escaped//+/\\+}
         if [[ $content =~ (^|[^0-9A-Za-z.+~_-])$escaped([^0-9A-Za-z.+~_-]|$) || $content == *"gnulinux-$abi-"* ]]; then
@@ -347,57 +462,105 @@ if [[ -e /boot/grub/grubenv ]]; then
         esac
     done <<<"$grub_environment"
 fi
-for path in /vmlinuz /initrd.img /boot/vmlinuz /boot/initrd.img /boot/Image /boot/zImage /boot/uImage /boot/uInitrd /boot/dtb; do
-    [[ -L $path ]] || continue
+BOOT_ALIASES=(/vmlinuz /vmlinux /initrd.img /boot/vmlinuz /boot/vmlinux /boot/initrd.img /boot/Image /boot/zImage /boot/uImage /boot/uInitrd /boot/dtb)
+for alias in "${!EXTRA_BOOT_ALIASES[@]}"; do BOOT_ALIASES+=("$alias"); done
+for path in "${BOOT_ALIASES[@]}"; do
+    [[ -e $path || -L $path ]] || continue
     target=$(realpath -e -- "$path") || die "启动链接损坏: $path"
-    matched=0
+    alias_kind=${path%.old}
+    matches=()
     for abi in "${ABIS[@]}"; do
+        matched=0
         case "$target" in
-            "${IMAGE_PATH[$abi]}"|"/boot/initrd.img-$abi"|"/boot/uInitrd-$abi"|"/boot/dtb-$abi"|"/boot/dtb-$abi/"*|"/usr/lib/linux-image-$abi/"*)
-                protect "$abi" "启动链接: $path"; matched=1 ;;
+            "${IMAGE_PATH[$abi]}"|"${BOOT_IMAGE[$abi]}"|"/boot/initrd.img-$abi"|"/boot/uInitrd-$abi"|"/boot/dtb-$abi"|"/boot/dtb-$abi/"*|"/usr/lib/linux-image-$abi"|"/usr/lib/linux-image-$abi/"*) matched=1 ;;
         esac
+        if ((!matched)) && [[ ! -L $path && -f $path ]]; then
+            case "$alias_kind" in
+                /vmlinuz|/vmlinux|/boot/vmlinuz|/boot/vmlinux|/boot/Image|/boot/zImage|/boot/uImage)
+                    if [[ -s ${IMAGE_PATH[$abi]} ]] && files_equal "$path" "${IMAGE_PATH[$abi]}"; then matched=1; fi ;;
+                /initrd.img|/boot/initrd.img)
+                    if [[ -s /boot/initrd.img-$abi ]] && files_equal "$path" "/boot/initrd.img-$abi"; then matched=1; fi ;;
+                /boot/uInitrd)
+                    if [[ -s /boot/uInitrd-$abi ]] && files_equal "$path" "/boot/uInitrd-$abi"; then
+                        matched=1
+                    elif [[ -s /boot/initrd.img-$abi ]]; then
+                        command -v od >/dev/null || die '需要 od 以核对 uInitrd。'
+                        magic=$(od -An -tx1 -N4 -- "$path") || die '无法读取 uInitrd 头。'
+                        magic=${magic//[[:space:]]/}
+                        if [[ $magic == 27051956 ]] && files_equal "$path" "/boot/initrd.img-$abi" 64 0; then matched=1; fi
+                    fi ;;
+            esac
+        fi
+        if ((matched)); then matches+=("$abi"); fi
     done
-    ((matched)) || die "启动链接目标无法归属已安装内核: $path -> $target"
+    if [[ $alias_kind == /boot/dtb && -d $path && ! -L $path ]]; then
+        # FAT boot partitions may move a DTB tree out of its versioned path.
+        # Without an attributable tree preserve all kernels instead of guessing.
+        command -v diff >/dev/null || die '需要 diff 以核对 DTB。'
+        for abi in "${ABIS[@]}"; do
+            [[ -d /boot/dtb-$abi ]] || continue
+            if diff -qr --no-dereference -- "$path" "/boot/dtb-$abi" >/dev/null; then
+                matches+=("$abi")
+            else
+                difference_status=$?
+                ((difference_status == 1)) || die '无法比对 DTB 目录。'
+            fi
+        done
+        if ((${#matches[@]} != 1)); then
+            warn 'DTB 目录无法唯一归属内核，全部内核保留。'
+            for abi in "${ABIS[@]}"; do protect "$abi" 'DTB 归属不明确'; done
+            continue
+        fi
+    fi
+    ((${#matches[@]} == 1)) || die "启动入口无法唯一归属已安装内核: $path -> $target"
+    protect "${matches[0]}" "启动入口: $path"
 done
+declare -a PROTECTED_FILES=()
 printf '%s\n' "--- $PLATFORM 内核安全管理助手 ---" "当前运行内核: $RUNNING_KERNEL" '受保护内核:'
 for abi in "${SORTED_ABIS[@]}"; do
     if [[ -n ${PROTECTED[$abi]+x} ]]; then
         printf '  - %s (%s)\n' "$abi" "${PROTECTED[$abi]}"
         [[ -s ${IMAGE_PATH[$abi]} ]] || die "受保护内核镜像缺失: ${IMAGE_PATH[$abi]}"
+        [[ -s ${BOOT_IMAGE[$abi]} ]] || die "受保护内核启动镜像缺失: ${BOOT_IMAGE[$abi]}"
         [[ -s /boot/initrd.img-$abi ]] || die "受保护内核 initrd 缺失: $abi"
         [[ -d /lib/modules/$abi && ! -L /lib/modules/$abi ]] || die "受保护内核模块目录异常: $abi"
+        PROTECTED_FILES+=("${IMAGE_PATH[$abi]}" "${BOOT_IMAGE[$abi]}" "/boot/initrd.img-$abi")
     else
         CANDIDATE_ABIS+=("$abi")
         while IFS= read -r package; do CANDIDATE_SET["$package"]=1; done <<<"${COMPONENTS[$abi]}"
     fi
 done
+PROTECTED_DIGESTS=$(sha256sum -- "${PROTECTED_FILES[@]}") || die '无法记录受保护内核文件校验值。'
 if ((${#CANDIDATE_ABIS[@]} == 0)); then
     printf '没有可清理的内核软件包。未归属软件包的旧文件不在自动删除范围内。\n'
     exit 0
 fi
-if [[ $PLATFORM == Armbian ]]; then
-    [[ -L /boot/Image || -L /boot/zImage || -L /boot/uImage ]] || die 'Armbian 启动镜像没有可验证的版本链接；FAT/定制布局暂不自动清理。'
-    [[ -L /boot/uInitrd ]] || die 'Armbian uInitrd 没有可验证的版本链接，拒绝清理。'
-elif [[ $PLATFORM == Debian ]]; then
-    command -v update-grub >/dev/null && [[ -d /boot/grub ]] || die '非 GRUB 的 Debian 启动布局暂不自动清理。'
+if [[ $BOOT_BACKEND == u-boot ]]; then
+    [[ -s /boot/Image || -s /boot/zImage || -s /boot/uImage ]] || die 'Armbian 启动镜像缺失。'
+    [[ -s /boot/uInitrd ]] || die 'Armbian uInitrd 缺失。'
+elif [[ $BOOT_BACKEND == unsupported ]]; then
+    die '启动布局尚不能可靠验证，拒绝自动清理。'
 fi
-dependency_names() {
-    local relations=${1//|/,} relation dependency
-    local -a parts=()
-    IFS=',' read -r -a parts <<<"$relations"
-    for relation in "${parts[@]}"; do
-        dependency=${relation#"${relation%%[![:space:]]*}"}
-        dependency=${dependency%%[[:space:](]*}; dependency=${dependency%%:*}
-        [[ -z $dependency ]] || printf '%s\n' "$dependency"
-    done
-}
 # Common headers are shared: every installed reverse dependent must be in scope.
 declare -A COMMON_HEADERS=()
-for package in "${!CANDIDATE_SET[@]}"; do
-    names=$(dependency_names "${DEPENDS[$package]}")
-    while IFS= read -r base; do
-        if [[ $base =~ ^linux-headers-[0-9].*-common(-rt)?$ && -n ${BY_BASE[$base]+x} ]]; then COMMON_HEADERS["${BY_BASE[$base]}"]=1; fi
-    done <<<"$names"
+for abi in "${CANDIDATE_ABIS[@]}"; do
+    while IFS= read -r package; do
+        [[ ${package%%:*} == "linux-headers-$abi" ]] || continue
+        names=$(dependency_names "${DEPENDS[$package]}")
+        while IFS= read -r base; do
+            [[ $base == linux-headers-[0-9]* && -n ${BY_BASE[$base]+x} ]] || continue
+            shared_version=${base#linux-headers-}
+            shared_version=${shared_version%%-common*}
+            [[ $abi == "$shared_version"-* ]] || continue
+            common=${BY_BASE[$base]}
+            load_files "$common"
+            while IFS= read -r path; do
+                case "$path" in
+                    "/usr/src/$base"|"/usr/src/$base/"*) COMMON_HEADERS["$common"]=1 ;;
+                esac
+            done <<<"${FILES[$common]}"
+        done <<<"$names"
+    done <<<"${COMPONENTS[$abi]}"
 done
 for common in "${!COMMON_HEADERS[@]}"; do
     base=${common%%:*}; shared=0
@@ -438,7 +601,7 @@ validate_simulation() {
 }
 simulate() {
     local output
-    output=$(apt-get -s "${APT_OPTIONS[@]}" purge -- "${CANDIDATES[@]}" 2>&1) || die "APT 模拟失败: $output"
+    output=$(apt-get -s "${APT_OPTIONS[@]}" -o Debug::NoLocking=true purge -- "${CANDIDATES[@]}" 2>&1) || die "APT 模拟失败: $output"
     validate_simulation "$output"
     printf '%s\n' "$output"
 }
@@ -457,6 +620,8 @@ current_boot=$(boot_state) || die '无法重新读取启动状态。'
 [[ $current_inventory == "$INITIAL_INVENTORY" ]] || die '确认期间软件包状态改变，请重新运行。'
 [[ $current_holds == "$INITIAL_HOLDS" ]] || die '确认期间 hold 状态改变，请重新运行。'
 [[ $current_boot == "$INITIAL_BOOT_STATE" ]] || die '确认期间启动配置改变，请重新运行。'
+current_digests=$(sha256sum -- "${PROTECTED_FILES[@]}") || die '无法重新读取受保护内核。'
+[[ $current_digests == "$PROTECTED_DIGESTS" ]] || die '确认期间受保护内核文件改变，请重新运行。'
 if [[ $PLATFORM == PVE ]]; then
     current_selection=$(proxmox-boot-tool kernel list 2>&1) || die '无法重新读取 PVE 内核选择。'
     [[ $current_selection == "$PVE_SELECTION" ]] || die 'PVE 内核选择改变，请重新运行。'
@@ -473,6 +638,8 @@ for package in "${CANDIDATES[@]}"; do printf '%s:%s;%s\n' "${package%%:*}" "${AR
 {
     printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nexport LC_ALL=C\n'
     printf 'EXPECTED_BOOT=%q\nEXPECTED_KERNEL=%q\n' "$INITIAL_BOOT_STATE" "$RUNNING_KERNEL"
+    printf 'EXPECTED_DIGESTS=%q\n' "$PROTECTED_DIGESTS"
+    declare -p PROTECTED_FILES
     declare -f boot_state
     cat <<'GUARD'
 fail() { printf '错误: APT 事务校验拒绝执行: %s\n' "$*" >&2; exit 1; }
@@ -481,6 +648,8 @@ root=${0%/*}
 [[ $(uname -r) == "$EXPECTED_KERNEL" ]] || fail '运行内核改变。'
 current_boot=$(boot_state) || fail '无法读取启动配置。'
 [[ $current_boot == "$EXPECTED_BOOT" ]] || fail '启动配置改变。'
+current_digests=$(sha256sum -- "${PROTECTED_FILES[@]}") || fail '无法读取受保护内核。'
+[[ $current_digests == "$EXPECTED_DIGESTS" ]] || fail '受保护内核文件改变。'
 holds=$(apt-mark showhold) || fail '无法读取 hold 列表。'
 declare -A allowed=() seen=() held=()
 while IFS=';' read -r key version; do allowed["$key"]=$version; done <"$root/allowed"
@@ -512,7 +681,7 @@ DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTIONS[@]}" \
 [[ -s $GUARD_DIR/receipt ]] || die 'APT 未执行事务校验，不能确认操作结果。'
 if [[ $PLATFORM == PVE && -s /etc/kernel/proxmox-boot-uuids ]]; then
     proxmox-boot-tool refresh || die 'PVE 启动分区同步失败，请检查后再重启。'
-elif [[ $PLATFORM == Debian || ( $PLATFORM == PVE && -d /boot/grub ) ]]; then
+elif [[ $BOOT_BACKEND == grub || ( $PLATFORM == PVE && -d /boot/grub ) ]]; then
     update-grub || die 'GRUB 更新失败，请检查后再重启。'
 fi
 audit_dpkg
@@ -522,8 +691,13 @@ while IFS=';' read -r package status rest; do [[ -z $package ]] || FINAL_STATUS[
 for package in "${CANDIDATES[@]}"; do [[ ${FINAL_STATUS[$package]:-not-installed} == not-installed ]] || die "软件包未完整 purge: $package"; done
 for abi in "${!PROTECTED[@]}"; do
     package=${IMAGE[$abi]}
-    [[ ${FINAL_STATUS[$package]:-} == installed && -s ${IMAGE_PATH[$abi]} && -s /boot/initrd.img-$abi && -d /lib/modules/$abi ]] || die "清理后受保护内核不完整: $abi"
+    [[ ${FINAL_STATUS[$package]:-} == installed && -s ${IMAGE_PATH[$abi]} && -s ${BOOT_IMAGE[$abi]} && -s /boot/initrd.img-$abi && -d /lib/modules/$abi ]] || die "清理后受保护内核不完整: $abi"
+    while IFS= read -r package; do
+        [[ ${FINAL_STATUS[$package]:-} == installed ]] || die "清理后受保护内核组件缺失: $package"
+    done <<<"${COMPONENTS[$abi]}"
 done
+current_digests=$(sha256sum -- "${PROTECTED_FILES[@]}") || die '无法校验清理后的受保护内核。'
+[[ $current_digests == "$PROTECTED_DIGESTS" ]] || die '清理后受保护内核文件发生改变，请检查后再重启。'
 printf '\n已完成精确的软件包清理，受保护内核通过文件与包状态校验。\n'
 printf '未执行 autoremove、手工残留删除或重启；文件校验不等于实机启动验证。\n'
 }
