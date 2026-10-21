@@ -631,6 +631,8 @@ FINAL_SIMULATION=$(simulate) || exit 1
 
 # Check APT's actual, locked transaction before dpkg. Protocol v3 includes the
 # installed version and architecture. The hook also works with curl | bash.
+# /run may be mounted noexec: use the system interpreter to read the hook.
+[[ -x /bin/bash ]] || die '无法执行事务校验所需的 /bin/bash。'
 for command_name in mktemp chmod rm rmdir; do command -v "$command_name" >/dev/null || die "缺少必需命令: $command_name"; done
 GUARD_DIR=$(mktemp -d /run/kernel-manager.XXXXXXXX) || die '无法创建事务校验目录。'
 chmod 700 "$GUARD_DIR"
@@ -673,11 +675,12 @@ for key in "${!allowed[@]}"; do [[ -n ${seen[$key]+x} ]] || fail "事务缺少�
 printf 'verified\n' >"$root/receipt"
 GUARD
 } >"$GUARD_DIR/guard"
-chmod 700 "$GUARD_DIR/guard"
+chmod 600 "$GUARD_DIR/guard"
+# APT looks up protocol options using the command's first word, /bin/bash.
 DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTIONS[@]}" \
-    -o "DPkg::Pre-Install-Pkgs::=$GUARD_DIR/guard" \
-    -o "DPkg::Tools::Options::$GUARD_DIR/guard::Version=3" \
-    -o "DPkg::Tools::Options::$GUARD_DIR/guard::InfoFD=0" purge -y -- "${CANDIDATES[@]}"
+    -o "DPkg::Pre-Install-Pkgs::=/bin/bash $GUARD_DIR/guard" \
+    -o DPkg::Tools::Options::/bin/bash::Version=3 \
+    -o DPkg::Tools::Options::/bin/bash::InfoFD=0 purge -y -- "${CANDIDATES[@]}"
 [[ -s $GUARD_DIR/receipt ]] || die 'APT 未执行事务校验，不能确认操作结果。'
 if [[ $PLATFORM == PVE && -s /etc/kernel/proxmox-boot-uuids ]]; then
     proxmox-boot-tool refresh || die 'PVE 启动分区同步失败，请检查后再重启。'
